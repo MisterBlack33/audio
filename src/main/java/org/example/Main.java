@@ -24,6 +24,11 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
+import org.jaudiotagger.audio.AudioFile;
+import org.jaudiotagger.audio.AudioFileIO;
+import org.jaudiotagger.tag.FieldKey;
+import org.jaudiotagger.tag.Tag;
+
 public class Main {
 
     public static void main(String[] args) {
@@ -86,6 +91,7 @@ public class Main {
         System.out.println("Was moechtest du tun?");
         System.out.println("1 = Dateinamen auflisten (dateiliste.txt erzeugen)");
         System.out.println("2 = Dateien anhand einer CSV-Liste umbenennen");
+        System.out.println("3 = Metadaten (Interpret, Album) aus CSV-Datei in die Dateien schreiben");
         System.out.print("Eingabe: ");
         String choice = scanner.nextLine().trim();
 
@@ -96,6 +102,13 @@ public class Main {
                     f -> f.isFile() && f.getName().toLowerCase().endsWith(".csv"),
                     "Bitte eine CSV-Datei ablegen.",
                     csvFile -> renameFromCsv(folder, csvFile)));
+        } else if (choice.equals("3")) {
+            SwingUtilities.invokeLater(() -> createDropWindow(
+                    "Metadaten-CSV hierher ziehen",
+                    "CSV-Datei hier ablegen<br>(name;interpret;album)",
+                    f -> f.isFile() && f.getName().toLowerCase().endsWith(".csv"),
+                    "Bitte eine CSV-Datei ablegen.",
+                    csvFile -> writeMetadataFromCsv(folder, csvFile)));
         } else {
             scanAndWrite(folder);
         }
@@ -133,32 +146,18 @@ public class Main {
         }
 
         System.out.println("Baue Dateiindex fuer: " + folder.getAbsolutePath());
-        Map<String, List<Path>> index = new HashMap<>();
-        try (Stream<Path> paths = Files.walk(folder.toPath())) {
-            paths.filter(Files::isRegularFile).forEach(path -> {
-                String name = path.getFileName().toString();
-                index.computeIfAbsent(name, k -> new ArrayList<>()).add(path);
-            });
-        } catch (IOException e) {
-            System.out.println("Fehler beim Einlesen des Ordners: " + e.getMessage());
-            System.exit(1);
-        }
+        Map<String, List<Path>> index = buildFileIndex(folder);
+        if (index == null) return;
 
-        List<String> lines;
-        try {
-            lines = Files.readAllLines(csvFile.toPath(), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            System.out.println("Fehler beim Lesen der CSV-Datei: " + e.getMessage());
-            System.exit(1);
-            return;
-        }
+        List<String> lines = readCsvLines(csvFile);
+        if (lines == null) return;
 
         int renamed = 0;
         int notFound = 0;
         int failed = 0;
 
         for (int i = 0; i < lines.size(); i++) {
-            String line = lines.get(i);
+            String line = stripBomIfFirstLine(lines.get(i), i);
             if (line.trim().isEmpty()) continue;
 
             try {
@@ -200,6 +199,147 @@ public class Main {
         System.out.println();
         System.out.println("Fertig. " + renamed + " Dateien umbenannt, " + notFound + " nicht gefunden, " + failed + " Fehler.");
         System.exit(0);
+    }
+
+    /**
+     * Liest eine CSV-Datei im Format "name;interpret;album" ein und schreibt die
+     * jeweiligen Werte als Interpret- und Album-Metadaten (ID3-Tags bei MP3,
+     * MP4-Atome bei M4A, ...) in die passenden Dateien im Zielordner.
+     */
+    private static void writeMetadataFromCsv(File folder, File csvFile) {
+        if (!csvFile.isFile()) {
+            System.out.println("CSV-Datei nicht gefunden: " + csvFile.getAbsolutePath());
+            System.exit(1);
+        }
+
+        System.out.println("Baue Dateiindex fuer: " + folder.getAbsolutePath());
+        Map<String, List<Path>> index = buildFileIndex(folder);
+        if (index == null) return;
+
+        List<String> lines = readCsvLines(csvFile);
+        if (lines == null) return;
+
+        int updated = 0;
+        int skippedEmpty = 0;
+        int notFound = 0;
+        int failed = 0;
+
+        for (int i = 0; i < lines.size(); i++) {
+            String line = stripBomIfFirstLine(lines.get(i), i);
+            if (line.trim().isEmpty()) continue;
+
+            String[] parts;
+            try {
+                parts = parseCsvLine(line);
+            } catch (Exception e) {
+                System.out.println("FEHLER in Zeile " + (i + 1) + ": " + e.getMessage());
+                failed++;
+                continue;
+            }
+            if (parts.length < 1) continue;
+
+            String fileName = parts[0].trim();
+            String interpret = parts.length > 1 ? parts[1].trim() : "";
+            String album = parts.length > 2 ? parts[2].trim() : "";
+
+            if (i == 0 && fileName.equalsIgnoreCase("name")) {
+                continue; // Kopfzeile ueberspringen
+            }
+            if (fileName.isEmpty()) continue;
+
+            if (interpret.isEmpty() && album.isEmpty()) {
+                skippedEmpty++;
+                continue;
+            }
+
+            List<Path> matches = index.get(fileName);
+            if (matches == null || matches.isEmpty()) {
+                System.out.println("NICHT GEFUNDEN: " + fileName);
+                notFound++;
+                continue;
+            }
+
+            for (Path filePath : matches) {
+                try {
+                    writeTags(filePath.toFile(), interpret, album);
+                    StringBuilder msg = new StringBuilder("OK: " + fileName);
+                    if (!interpret.isEmpty()) msg.append("  Interpret=\"").append(interpret).append("\"");
+                    if (!album.isEmpty()) msg.append("  Album=\"").append(album).append("\"");
+                    System.out.println(msg);
+                    updated++;
+                } catch (Exception e) {
+                    System.out.println("FEHLER bei \"" + fileName + "\": " + e.getMessage());
+                    failed++;
+                }
+            }
+        }
+
+        System.out.println();
+        System.out.println("Fertig. " + updated + " Dateien aktualisiert, " + skippedEmpty
+                + " ohne Metadaten uebersprungen, " + notFound + " nicht gefunden, " + failed + " Fehler.");
+        System.exit(0);
+    }
+
+    /**
+     * Schreibt Interpret und/oder Album in die Metadaten einer Audiodatei.
+     * Leere Werte werden nicht angefasst (bestehender Tag-Wert bleibt erhalten).
+     */
+    private static void writeTags(File audioFile, String interpret, String album) throws Exception {
+        AudioFile f = AudioFileIO.read(audioFile);
+        Tag tag = f.getTagOrCreateAndSetDefault();
+
+        if (!interpret.isEmpty()) {
+            tag.setField(FieldKey.ARTIST, interpret);
+        }
+        if (!album.isEmpty()) {
+            tag.setField(FieldKey.ALBUM, album);
+        }
+
+        f.commit();
+    }
+
+    /**
+     * Baut einen Index Dateiname -> Pfade fuer alle regulaeren Dateien im Ordner (rekursiv).
+     * Gibt bei einem Lesefehler null zurueck (Prozess wird dabei mit exit code 1 beendet).
+     */
+    private static Map<String, List<Path>> buildFileIndex(File folder) {
+        Map<String, List<Path>> index = new HashMap<>();
+        try (Stream<Path> paths = Files.walk(folder.toPath())) {
+            paths.filter(Files::isRegularFile).forEach(path -> {
+                String name = path.getFileName().toString();
+                index.computeIfAbsent(name, k -> new ArrayList<>()).add(path);
+            });
+        } catch (IOException e) {
+            System.out.println("Fehler beim Einlesen des Ordners: " + e.getMessage());
+            System.exit(1);
+            return null;
+        }
+        return index;
+    }
+
+    /**
+     * Liest alle Zeilen einer CSV-Datei als UTF-8 ein.
+     * Gibt bei einem Lesefehler null zurueck (Prozess wird dabei mit exit code 1 beendet).
+     */
+    private static List<String> readCsvLines(File csvFile) {
+        try {
+            return Files.readAllLines(csvFile.toPath(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            System.out.println("Fehler beim Lesen der CSV-Datei: " + e.getMessage());
+            System.exit(1);
+            return null;
+        }
+    }
+
+    /**
+     * Entfernt ein fuehrendes UTF-8-BOM-Zeichen (\uFEFF), falls es sich um die erste Zeile handelt.
+     * Manche Tools (z.B. Excel) schreiben dieses Zeichen an den Anfang von CSV-Dateien.
+     */
+    private static String stripBomIfFirstLine(String line, int lineIndex) {
+        if (lineIndex == 0 && !line.isEmpty() && line.charAt(0) == '\uFEFF') {
+            return line.substring(1);
+        }
+        return line;
     }
 
     private static String[] parseCsvLine(String line) {
