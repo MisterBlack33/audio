@@ -1,0 +1,61 @@
+version: 1.1
+target: humans-and-ai
+strict_mode: true
+
+limits:
+  class_max_lines: 200
+  method_max_lines: 60
+  recommended_method_max_lines: 30
+  max_nesting_depth: 3
+  max_method_parameters: 4
+  max_line_length: 120
+  max_direct_dependencies: 5
+
+rules:
+  readability_first: true
+  deterministic_behavior: true
+  hidden_side_effects: false
+  dependency_injection_required: true
+  cyclic_dependencies_allowed: false
+  test_coverage_min: 0.90
+  persistent_data_immutable_unless_layout_change: true
+  logs_persist_across_instances: true
+  comments_only_where_meaningful: true
+
+feature_workflow:
+  # Neue, vom Nutzer aktiv aufrufbare Features (Menüpunkte, Buttons, Kommandos,
+  # neue Sidebar-Einträge etc.) werden zuerst ausschließlich in der Testsuite
+  # angesiedelt (z.B. hinter einem Test-Suite-Flag/Menüpunkt, siehe
+  # GuiSidebar "TEST-SUITE (nur Entwicklung)").
+  # Erst mit Erreichen von Feature-Version 1.0 wird der Code in den
+  # produktiven Teil übernommen.
+  # Änderungen an bereits bestehenden, produktiven Features fallen NICHT
+  # unter diese Regel und werden direkt im Produktivcode bearbeitet.
+  new_user_invoked_features_start_in_test_suite: true
+  migration_to_production_requires: "feature_version_1.0"
+  exempt: existing_feature_modifications
+
+forbidden_patterns:
+  - god_classes
+  - spaghetti_code
+  - copy_paste_code
+  - magic_numbers
+  - global_state
+  - mutable_static_variables
+  - nested_ternary_operators
+  - empty_catch_blocks
+  - dead_entry_points
+
+testing:
+  deterministic: true
+  independent: true
+  arrange_act_assert: true
+  min_line_coverage: 0.90
+
+priorities:
+  - correctness
+  - security
+  - readability
+  - maintainability
+  - performance
+  - brevity
